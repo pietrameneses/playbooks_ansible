@@ -1,0 +1,120 @@
+---
+
+- name: Inventário de rede via UniFi
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    unifi_host: "https://192.168.1.1"
+    unifi_api_key: ""            
+    pagina: 200                  
+    pasta_saida: "./inventario"
+
+  tasks:
+
+    - name: Validar que a API key foi informada
+      ansible.builtin.assert:
+        that:
+          - unifi_api_key | length > 0
+        fail_msg: "Informe a chave com: -e 'unifi_api_key=SUA_CHAVE'"
+
+    - name: Criar a pasta de saída
+      ansible.builtin.file:
+        path: "{{ pasta_saida }}"
+        state: directory
+        mode: "0755"
+
+    - name: Listar os sites do controlador
+      ansible.builtin.uri:
+        url: "{{ unifi_host }}/proxy/network/integration/v1/sites"
+        method: GET
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+          Accept: application/json
+        validate_certs: false      
+      register: resp_sites
+
+    - name: Guardar o ID do site
+      ansible.builtin.set_fact:
+        site_id: "{{ resp_sites.json.data[0].id }}"
+
+    - name: Mostrar o site encontrado
+      ansible.builtin.debug:
+        msg: "Site: {{ resp_sites.json.data[0].internalReference | default(site_id) }}"
+
+    - name: Consultar a primeira página de clientes
+      ansible.builtin.uri:
+        url: "{{ unifi_host }}/proxy/network/integration/v1/sites/{{ site_id }}/clients?limit={{ pagina }}&offset=0"
+        method: GET
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+          Accept: application/json
+        validate_certs: false
+      register: clientes_p1
+
+    - name: Consultar as páginas restantes de clientes
+      ansible.builtin.uri:
+        url: "{{ unifi_host }}/proxy/network/integration/v1/sites/{{ site_id }}/clients?limit={{ pagina }}&offset={{ item }}"
+        method: GET
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+          Accept: application/json
+        validate_certs: false
+      register: clientes_resto
+      loop: "{{ range(pagina, clientes_p1.json.totalCount | int, pagina) | list }}"
+      when: (clientes_p1.json.totalCount | int) > (pagina | int)
+
+    - name: Juntar todos os clientes
+      ansible.builtin.set_fact:
+        clientes: >-
+          {{ clientes_p1.json.data +
+             (clientes_resto.results | default([]) | map(attribute='json.data') | flatten) }}
+
+    - name: Consultar os dispositivos UniFi
+      ansible.builtin.uri:
+        url: "{{ unifi_host }}/proxy/network/integration/v1/sites/{{ site_id }}/devices?limit={{ pagina }}&offset=0"
+        method: GET
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+          Accept: application/json
+        validate_certs: false
+      register: resp_devices
+
+    - name: Salvar as respostas cruas da API
+      ansible.builtin.copy:
+        dest: "{{ pasta_saida }}/{{ item.arquivo }}"
+        content: "{{ item.dados | to_nice_json }}"
+        mode: "0644"
+      loop:
+        - { arquivo: "clientes-bruto.json", dados: "{{ clientes }}" }
+        - { arquivo: "dispositivos-bruto.json", dados: "{{ resp_devices.json.data }}" }
+      loop_control:
+        label: "{{ item.arquivo }}"
+
+    - name: Gerar o CSV de clientes
+      ansible.builtin.copy:
+        dest: "{{ pasta_saida }}/clientes.csv"
+        mode: "0644"
+        content: |
+          nome,ip,mac,tipo,conectado_desde,id
+          {% for c in clientes %}
+          "{{ c.name | default('') }}","{{ c.ipAddress | default('') }}","{{ c.macAddress | default('') }}","{{ c.type | default('') }}","{{ c.connectedAt | default('') }}","{{ c.id | default('') }}"
+          {% endfor %}
+
+    - name: Gerar o CSV de dispositivos
+      ansible.builtin.copy:
+        dest: "{{ pasta_saida }}/dispositivos.csv"
+        mode: "0644"
+        content: |
+          nome,modelo,ip,mac,estado,firmware,id
+          {% for d in resp_devices.json.data %}
+          "{{ d.name | default('') }}","{{ d.model | default('') }}","{{ d.ipAddress | default('') }}","{{ d.macAddress | default('') }}","{{ d.state | default('') }}","{{ d.firmwareVersion | default('') }}","{{ d.id | default('') }}"
+          {% endfor %}
+
+    - name: Resumo
+      ansible.builtin.debug:
+        msg:
+          - "Clientes: {{ clientes | length }}"
+          - "Dispositivos UniFi: {{ resp_devices.json.data | length }}"
+          - "Arquivos gerados em: {{ pasta_saida }}"
