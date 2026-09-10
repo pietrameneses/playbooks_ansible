@@ -6,7 +6,7 @@
   gather_facts: false
 
   vars:
-    unifi_host: "https://192.168.1.1"
+    unifi_host: ""
     unifi_api_key: ""            
     pagina: 200                  
     pasta_saida: "./inventario"
@@ -17,6 +17,7 @@
       ansible.builtin.assert:
         that:
           - unifi_api_key | length > 0
+          - unifi_host | length > 0
         fail_msg: "Informe a chave com: -e 'unifi_api_key=SUA_CHAVE'"
 
     - name: Criar a pasta de saída
