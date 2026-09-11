@@ -1,33 +1,4 @@
 ---
-# ============================================================
-# Inventário de rede via UniFi — com fabricante por OUI
-# ============================================================
-#
-# COMO RODAR
-#   ansible-playbook inventario-unifi.yml \
-#     -e "unifi_host=https://IP_DO_CONTROLADOR unifi_api_key=SUA_CHAVE"
-#
-#   Para incluir também os dispositivos offline (histórico):
-#     -e "incluir_offline=true"
-#
-# O QUE GERA (em ./inventario/)
-#   clientes.csv        — dispositivos da rede, com fabricante
-#   dispositivos.csv    — equipamentos UniFi (gateway, switches, APs)
-#   clientes-bruto.json — resposta crua, útil para conferir campos
-#
-# COMO DESCOBRE O FABRICANTE
-#   Os 3 primeiros octetos do MAC são o OUI, um registro público
-#   mantido pela IEEE. O playbook baixa essa base e cruza.
-#   Não depende de campo do UniFi.
-#
-# LIMITAÇÃO CONHECIDA
-#   O sistema operacional não é obtido. O UniFi devolve um código
-#   numérico (os_name) sem tabela de tradução pública, e mesmo
-#   traduzido seria estimativa por fingerprint. Para SO confiável
-#   é necessário acesso à máquina (SSH/WinRM) ou ferramenta de
-#   inventário dedicada.
-# ============================================================
-
 - name: Inventário de rede via UniFi
   hosts: localhost
   connection: local
@@ -65,8 +36,6 @@
         state: directory
         mode: "0755"
 
-    # --- Consultar o UniFi ------------------------------------
-
     - name: Consultar os clientes da rede
       ansible.builtin.uri:
         url: "{{ unifi_host }}/proxy/network/api/s/{{ unifi_site }}/stat/{{ 'alluser' if incluir_offline | bool else 'sta' }}"
@@ -92,8 +61,6 @@
       ansible.builtin.set_fact:
         clientes: "{{ resp_clientes.json.data }}"
         equipamentos: "{{ resp_devices.json.data }}"
-
-    # --- Descobrir os fabricantes pelo MAC --------------------
 
     - name: Baixar a base de OUI da IEEE
       ansible.builtin.get_url:
@@ -142,8 +109,6 @@
     - name: Montar a tabela de fabricantes
       ansible.builtin.set_fact:
         fabricantes: "{{ (busca_oui.stdout | default('{}')) | from_json }}"
-
-    # --- Saídas -----------------------------------------------
 
     - name: Salvar a resposta crua dos clientes
       ansible.builtin.copy:
