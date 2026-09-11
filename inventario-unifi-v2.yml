@@ -1,0 +1,201 @@
+---
+# ============================================================
+# Inventário de rede via UniFi — com fabricante por OUI
+# ============================================================
+#
+# COMO RODAR
+#   ansible-playbook inventario-unifi.yml \
+#     -e "unifi_host=https://IP_DO_CONTROLADOR unifi_api_key=SUA_CHAVE"
+#
+#   Para incluir também os dispositivos offline (histórico):
+#     -e "incluir_offline=true"
+#
+# O QUE GERA (em ./inventario/)
+#   clientes.csv        — dispositivos da rede, com fabricante
+#   dispositivos.csv    — equipamentos UniFi (gateway, switches, APs)
+#   clientes-bruto.json — resposta crua, útil para conferir campos
+#
+# COMO DESCOBRE O FABRICANTE
+#   Os 3 primeiros octetos do MAC são o OUI, um registro público
+#   mantido pela IEEE. O playbook baixa essa base e cruza.
+#   Não depende de campo do UniFi.
+#
+# LIMITAÇÃO CONHECIDA
+#   O sistema operacional não é obtido. O UniFi devolve um código
+#   numérico (os_name) sem tabela de tradução pública, e mesmo
+#   traduzido seria estimativa por fingerprint. Para SO confiável
+#   é necessário acesso à máquina (SSH/WinRM) ou ferramenta de
+#   inventário dedicada.
+# ============================================================
+
+- name: Inventário de rede via UniFi
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    unifi_host: ""
+    unifi_api_key: ""
+    unifi_site: "default"
+    incluir_offline: false
+    pasta_saida: "./inventario"
+    oui_url: "https://standards-oui.ieee.org/oui/oui.txt"
+    oui_cache: "/tmp/oui.txt"
+    # Codigos de os_name do UniFi, deduzidos cruzando com hostnames reais.
+    # O UniFi nao publica essa tabela; o valor 1 e generico e aparece em
+    # Windows, impressoras e outros, por isso nao esta mapeado aqui.
+    mapa_so:
+      "24": "iOS / iPadOS"
+      "56": "Android"
+      "72": "macOS"
+      "3": "Linux"
+
+  tasks:
+
+    - name: Validar os parâmetros de conexão
+      ansible.builtin.assert:
+        that:
+          - unifi_host | length > 0
+          - unifi_api_key | length > 0
+        fail_msg: "Informe o endereço do controlador e a API key."
+
+    - name: Criar a pasta de saída
+      ansible.builtin.file:
+        path: "{{ pasta_saida }}"
+        state: directory
+        mode: "0755"
+
+    # --- Consultar o UniFi ------------------------------------
+
+    - name: Consultar os clientes da rede
+      ansible.builtin.uri:
+        url: "{{ unifi_host }}/proxy/network/api/s/{{ unifi_site }}/stat/{{ 'alluser' if incluir_offline | bool else 'sta' }}"
+        method: GET
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+          Accept: application/json
+        validate_certs: false
+        return_content: true
+      register: resp_clientes
+
+    - name: Consultar os equipamentos UniFi
+      ansible.builtin.uri:
+        url: "{{ unifi_host }}/proxy/network/api/s/{{ unifi_site }}/stat/device"
+        method: GET
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+          Accept: application/json
+        validate_certs: false
+      register: resp_devices
+
+    - name: Guardar as listas
+      ansible.builtin.set_fact:
+        clientes: "{{ resp_clientes.json.data }}"
+        equipamentos: "{{ resp_devices.json.data }}"
+
+    # --- Descobrir os fabricantes pelo MAC --------------------
+
+    - name: Baixar a base de OUI da IEEE
+      ansible.builtin.get_url:
+        url: "{{ oui_url }}"
+        dest: "{{ oui_cache }}"
+        mode: "0644"
+        timeout: 120
+      register: download_oui
+      failed_when: false
+
+    - name: Avisar se o download falhou
+      ansible.builtin.debug:
+        msg: "Não foi possível baixar a base de OUI. O CSV sairá sem a coluna de fabricante."
+      when: download_oui is failed or not (download_oui.dest is defined)
+
+    - name: Montar a lista de prefixos presentes na rede
+      ansible.builtin.copy:
+        dest: /tmp/prefixos-mac.txt
+        mode: "0644"
+        content: |
+          {% for m in (clientes + equipamentos) | map(attribute='mac') | select('string') | unique %}
+          {{ m[0:8] | upper | replace(':', '-') }}
+          {% endfor %}
+
+    - name: Procurar cada prefixo na base de OUI e montar um JSON
+      ansible.builtin.shell:
+        cmd: >-
+          grep -F -f /tmp/prefixos-mac.txt {{ oui_cache }}
+          | grep '(hex)'
+          | sed -E 's/[[:space:]]*\(hex\)[[:space:]]*/|/'
+          | awk -F'|' '
+              BEGIN { printf "{" }
+              {
+                gsub(/[\r\n\t]/, "", $1);
+                gsub(/[\r\n\t]/, "", $2);
+                gsub(/^[ ]+|[ ]+$/, "", $1);
+                gsub(/^[ ]+|[ ]+$/, "", $2);
+                gsub(/["\\]/, "", $2);
+                if ($1 != "") { printf "%s\"%s\":\"%s\"", sep, $1, $2; sep="," }
+              }
+              END { printf "}" }'
+      register: busca_oui
+      changed_when: false
+      failed_when: false
+
+    - name: Montar a tabela de fabricantes
+      ansible.builtin.set_fact:
+        fabricantes: "{{ (busca_oui.stdout | default('{}')) | from_json }}"
+
+    # --- Saídas -----------------------------------------------
+
+    - name: Salvar a resposta crua dos clientes
+      ansible.builtin.copy:
+        dest: "{{ pasta_saida }}/clientes-bruto.json"
+        content: "{{ clientes | to_nice_json }}"
+        mode: "0644"
+
+    - name: Gerar o CSV de clientes
+      ansible.builtin.copy:
+        dest: "{{ pasta_saida }}/clientes.csv"
+        mode: "0644"
+        content: |
+          nome,hostname,ip,mac,fabricante,so_estimado,conexao,rede,vlan,switch_ou_ap,visto_em
+          {% for c in clientes %}
+          {% set mac = c.mac | default('') %}
+          {% set pref = mac[0:8] | upper | replace(':', '-') %}
+          {% set aleatorio = mac | length > 1 and mac[1] | lower in ['2', '6', 'a', 'e'] %}
+          {% set host = c.hostname | default('') %}
+          {% if c.oui is defined and c.oui | length > 0 %}
+          {%   set fab = c.oui %}
+          {% elif fabricantes[pref] is defined %}
+          {%   set fab = fabricantes[pref] %}
+          {% elif aleatorio %}
+          {%   set fab = 'MAC aleatorizado' %}
+          {% else %}
+          {%   set fab = 'desconhecido' %}
+          {% endif %}
+          {% if mapa_so[c.os_name | default(0) | string] is defined %}
+          {%   set so = mapa_so[c.os_name | string] %}
+          {% elif host is match('(?i)^(desktop|laptop)-') %}
+          {%   set so = 'Windows (pelo padrao do hostname)' %}
+          {% else %}
+          {%   set so = 'nao identificado' %}
+          {% endif %}
+          "{{ c.name | default('') }}","{{ host }}","{{ c.ip | default(c.last_ip) | default('') }}","{{ mac }}","{{ fab }}","{{ so }}","{{ 'cabo' if c.is_wired | default(false) else 'wifi' }}","{{ c.network | default('') }}","{{ c.vlan | default('') }}","{{ c.last_uplink_name | default('') }}","{{ '%Y-%m-%d %H:%M' | strftime(c.last_seen) if c.last_seen is defined else '' }}"
+          {% endfor %}
+
+    - name: Gerar o CSV de equipamentos UniFi
+      ansible.builtin.copy:
+        dest: "{{ pasta_saida }}/dispositivos.csv"
+        mode: "0644"
+        content: |
+          nome,modelo,tipo,ip,mac,fabricante,versao,adotado,uptime_dias
+          {% for d in equipamentos %}
+          {% set pref = (d.mac | default('') )[0:8] | upper | replace(':', '-') %}
+          "{{ d.name | default('') }}","{{ d.model | default('') }}","{{ d.type | default('') }}","{{ d.ip | default('') }}","{{ d.mac | default('') }}","{{ fabricantes[pref] | default('desconhecido') }}","{{ d.version | default('') }}","{{ d.adopted | default('') }}","{{ ((d.uptime | default(0)) / 86400) | round(1) }}"
+          {% endfor %}
+
+    - name: Resumo
+      ansible.builtin.debug:
+        msg:
+          - "Clientes: {{ clientes | length }} ({{ 'inclui offline' if incluir_offline | bool else 'apenas conectados' }})"
+          - "Equipamentos UniFi: {{ equipamentos | length }}"
+          - "Fabricantes identificados: {{ fabricantes | length }} prefixos"
+          - "Arquivos em: {{ pasta_saida }}"
